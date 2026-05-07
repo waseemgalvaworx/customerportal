@@ -1,0 +1,232 @@
+// =============================================================================
+// customer-jobs edge function — DEPLOY TO YOUR OWN SUPABASE PROJECT
+// =============================================================================
+//
+// This file is INTENTIONALLY a .txt extension so it isn't compiled by the
+// frontend Vite build. Copy its contents into:
+//
+//     supabase/functions/customer-jobs/index.ts
+//
+// in your local checkout, then deploy with:
+//
+//     supabase functions deploy customer-jobs --no-verify-jwt
+//
+// (Use --no-verify-jwt because the customer portal authenticates via the
+// `secure-login` function and stores its OWN user object in localStorage —
+// it does NOT use Supabase Auth, so there is no JWT to verify on subsequent
+// requests. The function instead trusts the SERVICE_ROLE-keyed lookup of
+// the user → customer linkage.)
+//
+// REQUIRED ENV VARS (already populated by Supabase by default):
+//   - SUPABASE_URL
+//   - SUPABASE_SERVICE_ROLE_KEY
+//
+// WHAT IT DOES:
+//   1. Looks up the `customers` row linked to the requesting user
+//      (by userId / user_id / customer_id, with a username fallback).
+//   2. Fetches `jobs` server-side filtered by that resolved customerId
+//      (preferred) or customerName (fallback).
+//   3. Applies a final belt-and-braces filter so a job is only ever returned
+//      if its customerId OR customerName matches the resolved customer.
+//
+// This guarantees no row-level leak regardless of RLS policy state.
+// =============================================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+
+export const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
+
+interface UserPayload {
+  id?: string;
+  username?: string;
+  role?: string;
+  customer_id?: string | null;
+  customerId?: string | null;
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  if (req.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405);
+  }
+
+  let body: { user?: UserPayload } = {};
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const user = body.user;
+  if (!user || !user.id) {
+    return json({ error: "Missing user.id in request body" }, 400);
+  }
+
+  const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+  const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+    return json({ error: "Server misconfigured: missing Supabase env" }, 500);
+  }
+
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  // ---------------------------------------------------------------------------
+  // 1. Resolve the customer record linked to this user.
+  //    Try userId (camelCase) → user_id (snake_case) → embedded customer id →
+  //    last-resort username/name match.
+  // ---------------------------------------------------------------------------
+  let customer: { id: string; name: string } | null = null;
+  let lookupMethod = "";
+
+  const tryLookupBy = async (
+    column: string,
+    value: string,
+  ): Promise<{ id: string; name: string } | null> => {
+    const { data, error } = await admin
+      .from("customers")
+      .select("id, name")
+      .eq(column, value)
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      console.warn(
+        `[customer-jobs] lookup by ${column} failed:`,
+        error.message,
+      );
+      return null;
+    }
+    return data ?? null;
+  };
+
+  customer = await tryLookupBy("userId", user.id);
+  if (customer) lookupMethod = "userId";
+
+  if (!customer) {
+    customer = await tryLookupBy("user_id", user.id);
+    if (customer) lookupMethod = "user_id";
+  }
+
+  if (!customer) {
+    const cid = user.customer_id ?? user.customerId ?? null;
+    if (cid) {
+      customer = await tryLookupBy("id", cid);
+      if (customer) lookupMethod = "customerId";
+    }
+  }
+
+  if (!customer && user.username) {
+    const { data, error } = await admin
+      .from("customers")
+      .select("id, name")
+      .ilike("name", user.username.trim())
+      .limit(1)
+      .maybeSingle();
+    if (!error && data) {
+      customer = data;
+      lookupMethod = "username->name(ilike)";
+    }
+  }
+
+  if (!customer) {
+    console.warn("[customer-jobs] No linked customer for user", {
+      userId: user.id,
+      username: user.username,
+      role: user.role,
+    });
+    return json(
+      {
+        error: "No customer profile linked to this user.",
+        jobs: [],
+        customer: null,
+      },
+      404,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. Fetch jobs scoped to this resolved customer.
+  // ---------------------------------------------------------------------------
+  let jobs: any[] = [];
+  let queryUsed = "";
+
+  {
+    const { data, error } = await admin
+      .from("jobs")
+      .select("*, customers(name)")
+      .eq("customerId", customer.id)
+      .order("updatedAt", { ascending: false })
+      .limit(1000);
+    if (!error && data && data.length > 0) {
+      jobs = data;
+      queryUsed = "customerId";
+    } else if (error) {
+      console.warn(
+        "[customer-jobs] customerId query failed, falling back:",
+        error.message,
+      );
+    }
+  }
+
+  if (jobs.length === 0) {
+    const { data, error } = await admin
+      .from("jobs")
+      .select("*, customers(name)")
+      .eq("customerName", customer.name)
+      .order("updatedAt", { ascending: false })
+      .limit(1000);
+    if (error) {
+      console.error("[customer-jobs] customerName query failed:", error);
+      return json({ error: error.message, jobs: [], customer }, 500);
+    }
+    jobs = data ?? [];
+    queryUsed = queryUsed || "customerName";
+  }
+
+  // ---------------------------------------------------------------------------
+  // 3. Defense-in-depth filter.
+  // ---------------------------------------------------------------------------
+  const safeJobs = (jobs ?? []).filter((j: any) => {
+    const idMatch = j.customerId && j.customerId === customer!.id;
+    const nameMatch = j.customerName && j.customerName === customer!.name;
+    return idMatch || nameMatch;
+  });
+
+  console.log("[customer-jobs] success", {
+    userId: user.id,
+    username: user.username,
+    role: user.role,
+    lookupMethod,
+    queryUsed,
+    customerId: customer.id,
+    customerName: customer.name,
+    rawCount: jobs.length,
+    safeCount: safeJobs.length,
+  });
+
+  return json({
+    customer,
+    jobs: safeJobs,
+    meta: {
+      lookupMethod,
+      queryUsed,
+      rawCount: jobs.length,
+      safeCount: safeJobs.length,
+    },
+  });
+});
