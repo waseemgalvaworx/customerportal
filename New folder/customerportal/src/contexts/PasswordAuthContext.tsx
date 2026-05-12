@@ -241,21 +241,58 @@ export const PasswordAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
           console.warn('[PasswordAuth] Supabase Auth attempt threw, falling back', e);
         }
       }
-
       // -----------------------------------------------------------------
       // 2. Legacy `secure-login` fallback
       // -----------------------------------------------------------------
+      // Helper: turn whatever the auth/edge-function layer threw at us
+      // into a friendly, user-facing message. The supabase-js client
+      // returns "Edge Function returned a non-2xx status code" verbatim
+      // for any 4xx/5xx response from `functions.invoke()`, which is
+      // useless to a customer. We map those — and the obvious "Invalid
+      // login credentials" Supabase Auth response — to a single clear
+      // sentence asking them to retry or contact their account manager.
+      const friendlyAuthError = (raw: unknown): string => {
+        const msg = typeof raw === 'string'
+          ? raw
+          : (raw && typeof (raw as any).message === 'string' ? (raw as any).message : '');
+        const lower = msg.toLowerCase();
+        // Specific Supabase / edge-function error shapes that mean
+        // "the credentials were rejected".
+        const looksLikeBadCreds =
+          lower.includes('non-2xx') ||
+          lower.includes('invalid login') ||
+          lower.includes('invalid credentials') ||
+          lower.includes('invalid username') ||
+          lower.includes('invalid password') ||
+          lower.includes('unauthorized') ||
+          lower.includes('unauthenticated') ||
+          lower.includes('forbidden') ||
+          lower.includes('not found') ||
+          lower.includes('user not found') ||
+          lower.includes('wrong password') ||
+          lower.includes('login failed');
+        if (looksLikeBadCreds || !msg) {
+          return 'Wrong username or password. Please check again or contact your account manager for assistance.';
+        }
+        // Network-level failures still get a clear, distinct message
+        // so the customer knows it isn't necessarily their credentials.
+        if (lower.includes('failed to fetch') || lower.includes('network')) {
+          return 'Network error. Please check your connection and try again.';
+        }
+        return msg;
+      };
+
       const { data, error: fnError } = await supabase.functions.invoke('secure-login', {
         body: { username: trimmed, password },
       });
 
       if (fnError) {
-        const msg = fnError.message || 'Login failed';
+        const msg = friendlyAuthError(fnError);
         setError(msg);
         return { ok: false, error: msg };
       }
       if (!data || data.error || !data.user) {
-        const msg = data?.error || 'Invalid credentials';
+        const msg = friendlyAuthError(data?.error || 'Invalid credentials');
         setError(msg);
         return { ok: false, error: msg };
       }
@@ -279,6 +316,7 @@ export const PasswordAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       setLoading(false);
     }
   }, []);
+
 
   const logout = useCallback(async () => {
     try {

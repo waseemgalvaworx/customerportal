@@ -1,19 +1,11 @@
 import React from 'react';
 import AppLayout from '@/components/AppLayout';
-import { AppProvider } from '@/contexts/AppContext';
-import { PasswordAuthProvider } from '@/contexts/PasswordAuthContext';
-import { RealtimeProvider } from '@/contexts/RealtimeContext';
 
+// Providers (AppProvider, PasswordAuthProvider, RealtimeProvider) used to
+// live here, but they're now hoisted up to App.tsx so every route shares
+// a single provider tree. Index just renders the customer-portal shell.
 const Index: React.FC = () => {
-  return (
-    <AppProvider>
-      <PasswordAuthProvider>
-        <RealtimeProvider>
-          <AppLayout />
-        </RealtimeProvider>
-      </PasswordAuthProvider>
-    </AppProvider>
-  );
+  return <AppLayout />;
 };
 
 export default Index;

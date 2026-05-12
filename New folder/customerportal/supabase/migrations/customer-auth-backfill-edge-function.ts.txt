@@ -1,0 +1,146 @@
+// =============================================================================
+// customer-auth-backfill edge function — DEPLOY TO YOUR OWN SUPABASE PROJECT
+// =============================================================================
+//
+// This file is INTENTIONALLY a .txt extension so it isn't compiled by the
+// frontend Vite build. Copy its contents into:
+//
+//     supabase/functions/customer-auth-backfill/index.ts
+//
+// in your local checkout, then deploy with:
+//
+//     supabase functions deploy customer-auth-backfill --no-verify-jwt
+//
+// REQUIRED ENV VARS (already populated by Supabase by default):
+//   - SUPABASE_URL
+//   - SUPABASE_SERVICE_ROLE_KEY
+//
+// WHAT IT DOES:
+//   1. Pages through every `customers` row where userId IS NULL.
+//   2. For each one, creates an auth.users record (or recovers an existing one
+//      if the email is already taken) with a strong random password.
+//   3. Writes the resulting auth user id back into customers.userId.
+//
+// Re-runnable: rows that are already linked are skipped automatically.
+// =============================================================================
+
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+
+  const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+  const SERVICE_ROLE = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  const result = {
+    processed: 0,
+    linked: 0,
+    skipped: 0,
+    errors: [] as Array<{ customerId: string; reason: string }>,
+  };
+
+  const PAGE = 50;
+  let offset = 0;
+
+  while (true) {
+    const { data: customers, error } = await admin
+      .from('customers')
+      .select('id, name, email, "userId"')
+      .is('userId', null)
+      .range(offset, offset + PAGE - 1);
+
+    if (error) {
+      return new Response(
+        JSON.stringify({ ...result, fatal: error.message }),
+        { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      );
+    }
+
+    if (!customers || customers.length === 0) break;
+
+    for (const c of customers as any[]) {
+      result.processed++;
+      if (c.userId) { result.skipped++; continue; }
+
+      const email: string | null = c.email ?? null;
+      if (!email) {
+        result.errors.push({ customerId: c.id, reason: 'no email on file' });
+        continue;
+      }
+
+      // Seed every backfilled account with a strong random password. Users
+      // will reset via "forgot password" the first time they log in via Auth.
+      const seedPassword = crypto.randomUUID() + crypto.randomUUID();
+
+      let authUserId: string | null = null;
+
+      const { data: created, error: createErr } = await admin.auth.admin.createUser({
+        email,
+        password: seedPassword,
+        email_confirm: true,
+        user_metadata: {
+          customer_id: c.id,
+          customer_name: c.name,
+          source: 'customer-auth-backfill',
+        },
+      });
+
+      if (created?.user) {
+        authUserId = created.user.id;
+      } else if (createErr) {
+        // Most common cause: email already exists in auth.users from a
+        // previous run. Recover by listing and matching.
+        const lower = email.toLowerCase();
+        let page = 1;
+        while (page <= 50 && !authUserId) {
+          const { data: list } = await admin.auth.admin.listUsers({ page, perPage: 200 });
+          const match = list?.users?.find((u: any) => (u.email ?? '').toLowerCase() === lower);
+          if (match) { authUserId = match.id; break; }
+          if (!list?.users || list.users.length < 200) break;
+          page++;
+        }
+        if (!authUserId) {
+          result.errors.push({ customerId: c.id, reason: createErr.message });
+          continue;
+        }
+      }
+
+      if (!authUserId) {
+        result.errors.push({ customerId: c.id, reason: 'createUser returned no id' });
+        continue;
+      }
+
+      const { error: updateErr } = await admin
+        .from('customers')
+        .update({ userId: authUserId })
+        .eq('id', c.id)
+        .is('userId', null);
+
+      if (updateErr) {
+        result.errors.push({ customerId: c.id, reason: `update failed: ${updateErr.message}` });
+        continue;
+      }
+
+      result.linked++;
+    }
+
+    if (customers.length < PAGE) break;
+    offset += PAGE;
+  }
+
+  return new Response(JSON.stringify(result, null, 2), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+  });
+});

@@ -1,6 +1,13 @@
 // Stage color palette ported from the React Native customer portal.
-// Pending = amber, Workshop = blue, Acid = red, Galva = purple,
+// Waiting = amber, Workshop = blue, Acid = red, Galva = purple,
 // Finishing = pink, Ready = green.
+//
+// NOTE: the internal stage KEY remains 'pending' (matches the canonical
+// item.status token written by the operator tools / migrations) but the
+// CUSTOMER-FACING LABEL is "Waiting" so the Job Details modal matches the
+// "Waiting" badge shown on the Active screen's job cards. Do not rename
+// the key — a lot of code (deriveEffectiveStage, classifyStage, the
+// activity_logs payloads) keys off the literal string 'pending'.
 
 export type StageKey = 'pending' | 'workshop' | 'acid' | 'galva' | 'finishing' | 'ready' | 'other';
 
@@ -15,7 +22,8 @@ export interface StageStyle {
 }
 
 export const STAGE_STYLES: Record<StageKey, StageStyle> = {
-  pending:   { key: 'pending',   label: 'Pending',   bar: 'bg-amber-500',  badgeBg: 'bg-amber-100',  badgeText: 'text-amber-800',  dot: 'bg-amber-500',  ring: 'ring-amber-300' },
+  pending:   { key: 'pending',   label: 'Waiting',   bar: 'bg-amber-500',  badgeBg: 'bg-amber-100',  badgeText: 'text-amber-800',  dot: 'bg-amber-500',  ring: 'ring-amber-300' },
+
   workshop:  { key: 'workshop',  label: 'Workshop',  bar: 'bg-blue-500',   badgeBg: 'bg-blue-100',   badgeText: 'text-blue-800',   dot: 'bg-blue-500',   ring: 'ring-blue-300' },
   acid:      { key: 'acid',      label: 'Acid',      bar: 'bg-rose-500',   badgeBg: 'bg-rose-100',   badgeText: 'text-rose-800',   dot: 'bg-rose-500',   ring: 'ring-rose-300' },
   galva:     { key: 'galva',     label: 'Galva',     bar: 'bg-violet-500', badgeBg: 'bg-violet-100', badgeText: 'text-violet-800', dot: 'bg-violet-500', ring: 'ring-violet-300' },

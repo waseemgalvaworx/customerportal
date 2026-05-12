@@ -84,32 +84,77 @@ end $$;
 -- -----------------------------------------------------------------------------
 -- 1. Snapshot the "before" state for the audit log at the bottom.
 -- -----------------------------------------------------------------------------
-create temp table _portal_backfill_before on commit drop as
-select
-  count(*)                              as portal_users_total,
-  count(*) filter (where customer_id is not null) as portal_users_with_customer_id,
-  (select count(*) from public.customers c where c."userId" is not null) as customers_linked_before
-from public.users u
-where lower(coalesce(u.role, '')) in ('customer_portal', 'customer');
+-- NOTE: some deployments of `public.users` do NOT have a `customer_id` column
+-- (the link is only stored on customers."userId" in the other direction).
+-- We detect that and gracefully skip the column-specific count + Pass 1.
+do $$
+declare
+  users_has_customer_id boolean;
+  before_total          bigint;
+  before_with_cid       bigint;
+  before_linked         bigint;
+begin
+  select exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'users' and column_name = 'customer_id'
+  ) into users_has_customer_id;
+
+  -- create the temp table with a stable shape regardless of schema variant
+  create temp table _portal_backfill_before (
+    portal_users_total            bigint,
+    portal_users_with_customer_id bigint,
+    customers_linked_before       bigint
+  ) on commit drop;
+
+  select count(*) into before_total
+  from public.users u
+  where lower(coalesce(u.role, '')) in ('customer_portal', 'customer');
+
+  if users_has_customer_id then
+    execute $sql$
+      select count(*) from public.users u
+      where lower(coalesce(u.role, '')) in ('customer_portal', 'customer')
+        and u.customer_id is not null
+    $sql$ into before_with_cid;
+  else
+    before_with_cid := null;  -- column doesn't exist on this deployment
+    raise notice 'public.users.customer_id column not present — Pass 1 will be skipped.';
+  end if;
+
+  select count(*) into before_linked
+  from public.customers c where c."userId" is not null;
+
+  insert into _portal_backfill_before values (before_total, before_with_cid, before_linked);
+end $$;
 
 
 
 -- -----------------------------------------------------------------------------
--- 2. PASS 1 — direct match via users.customer_id
+-- 2. PASS 1 — direct match via users.customer_id (only if the column exists)
 -- -----------------------------------------------------------------------------
 -- Most reliable: the portal user already has a customer_id pointing at the
 -- right row. We only need to copy users.id into customers."userId".
-with src as (
-  select u.id as user_id, u.customer_id
-  from public.users u
-  where lower(coalesce(u.role, '')) in ('customer_portal', 'customer')
-    and u.customer_id is not null
-)
-update public.customers c
-set "userId" = src.user_id
-from src
-where c.id = src.customer_id
-  and c."userId" is null;
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'users' and column_name = 'customer_id'
+  ) then
+    execute $sql$
+      with src as (
+        select u.id as user_id, u.customer_id
+        from public.users u
+        where lower(coalesce(u.role, '')) in ('customer_portal', 'customer')
+          and u.customer_id is not null
+      )
+      update public.customers c
+      set "userId" = src.user_id
+      from src
+      where c.id = src.customer_id
+        and c."userId" is null;
+    $sql$;
+  end if;
+end $$;
 
 
 -- -----------------------------------------------------------------------------

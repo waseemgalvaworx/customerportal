@@ -1,0 +1,4 @@
+{
+  "buildId": "__BUILD_ID__",
+  "note": "This file is rewritten at build time by the famous-build-id-injection Vite plugin. If you see literal __BUILD_ID__ here, the plugin did not run for this deploy."
+}

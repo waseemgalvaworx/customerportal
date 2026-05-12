@@ -3,12 +3,19 @@ import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
   Loader2, Package, FileText, History as HistoryIcon, MessageSquare,
   Box, Calendar as CalendarIcon, ArrowLeft, ArrowRight, GitBranch,
-  CheckCircle2,
+  CheckCircle2, Truck, User, StickyNote,
 } from 'lucide-react';
+
 import { supabase } from '@/lib/supabase';
 import { normalizeRows } from '@/lib/normalize';
-import type { Job } from './JobCard';
+import { extractContactName } from '@/lib/extractContactName';
+import { type Job, resolveJobNotes } from './JobCard';
+
 import { stageStyleFor, classifyStage, STAGE_STYLES, type StageKey } from '@/lib/stageColors';
+import { deriveEffectiveStage } from '@/lib/effectiveStage';
+
+
+
 
 interface Props {
   job: Job;
@@ -90,14 +97,33 @@ const isCompleted = (status?: string | null): boolean => {
   return HISTORY_STATUSES.some((h) => s === h);
 };
 
-const formatStatus = (s?: string | null): string => {
-  if (!s) return 'In Progress';
-  const lower = s.toLowerCase();
-  if (lower === 'in_progress' || lower === 'in progress' || lower === 'active') return 'In Progress';
-  if (lower === 'ready') return 'Ready';
-  if (lower === 'complete' || lower === 'completed' || lower === 'done') return 'Completed';
-  return s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, ' ');
+// Resolve the status label shown on the details summary pill. Mirrors
+// the JobCard logic so the details screen stays consistent with the
+// list:
+//   - terminal statuses (shipped/delivered/cancelled/archived/closed)
+//     -> matching terminal label
+//   - otherwise driven by the EFFECTIVE STAGE of the job (i.e. derived
+//     from items[].status, not the loose job.status):
+//       * all items pending          -> "Waiting"
+//       * all items at ready/terminal -> "Ready"
+//       * any item past pending       -> "In Progress"
+const formatStatus = (job: Job | { status?: string | null }): string => {
+  const s = (job as any)?.status;
+  if (s) {
+    const lower = String(s).toLowerCase().trim();
+    if (lower === 'shipped') return 'Shipped';
+    if (lower === 'delivered') return 'Delivered';
+    if (lower === 'cancelled' || lower === 'canceled') return 'Cancelled';
+    if (lower === 'archived' || lower === 'closed') return 'Completed';
+  }
+  // Derive from items[].status — this is the canonical source.
+  const stage = deriveEffectiveStage(job);
+  if (stage === 'pending') return 'Waiting';
+  if (stage === 'ready') return 'Ready';
+  return 'In Progress';
 };
+
+
 
 // The shared backend may store the per-job line items under any of these
 // keys depending on which tool wrote the row (web admin, RN portal,
@@ -600,6 +626,45 @@ const CustomerJobDetailsView: React.FC<Props> = ({ job, onBack }) => {
   const createdRef = job.created_at;
   const completedRef = job.updated_at || job.created_at;
 
+  // Resolve the dates we want to surface in the summary card. Mirrors the
+  // logic in JobCard so the details screen and the list card are
+  // consistent:
+  //   - tentativeDelivery: planned delivery date set during Planning. The
+  //     customer-jobs edge function exposes this as `delivery_date`. In
+  //     production it's sourced from the job's `production_finishing_date`
+  //     column. We fall back to the legacy `estimated_completion` for
+  //     older rows that pre-date that column.
+  //   - deliveredDate: actual physical delivery / shipment date. The edge
+  //     function exposes this as `delivered_date` (sourced from the job's
+  //     `delivered_at` column, populated when ops marks the job as
+  //     shipped/delivered). Fall back to updated_at as a last resort so
+  //     the summary card never shows a blank "Delivered" value for a
+  //     terminal job.
+  const tentativeDelivery =
+    (job as any).delivery_date ||
+    (job as any).production_finishing_date ||
+    (job as any).estimated_completion ||
+    null;
+  const deliveredDate =
+    (job as any).delivered_date ||
+    (job as any).delivered_at ||
+    completedRef;
+
+  // Operator-entered free-text notes. Sourced via the shared
+  // resolveJobNotes helper so we read `notes`, `job_notes`, AND
+  // `jobNotes` (snake/camel) for resilience and trim whitespace before
+  // deciding whether to render the Notes callout panel.
+  const notesText = resolveJobNotes(job);
+  const hasNotes = notesText.length > 0;
+
+  // The customer-contact / drop-off employee name lives inside the
+  // free-text notes ("Brought by: John Doe", "Contact: John", etc.) —
+  // there is no dedicated column for it in production. Parsed by
+  // extractContactName so we can show it as a first-class field in the
+  // summary card.
+  const contactName = extractContactName(notesText || (job as any).notes);
+
+
   const totalUpdates = stages.length;
   const itemsWithHistory = itemsJourney.length;
 
@@ -630,7 +695,8 @@ const CustomerJobDetailsView: React.FC<Props> = ({ job, onBack }) => {
                   {job.job_number || job.id.slice(0, 8)}
                 </span>
               </div>
-              <StatusPill status={job.status} />
+              <StatusPill job={job} />
+
             </div>
 
             <div className="bg-slate-50 rounded-xl grid grid-cols-3 divide-x divide-slate-200">
@@ -642,18 +708,41 @@ const CustomerJobDetailsView: React.FC<Props> = ({ job, onBack }) => {
               />
               <Stat
                 icon={<CalendarIcon className="w-4 h-4 text-slate-500" />}
-                value={formatShortDate(completed ? completedRef : createdRef)}
-                label={completed ? 'Completed' : 'Created'}
+                value={formatShortDate(completed ? deliveredDate : createdRef)}
+                label={completed ? 'Delivered' : 'Created'}
               />
             </div>
 
-            {completed && (
-              <div className="mt-3 flex items-center gap-2 text-sm text-emerald-700 font-semibold">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span>Completed: {formatLongDate(completedRef)}</span>
+            {/* Extra info rows: brought-by contact, expected delivery,
+                delivered date. These show conditionally so jobs that
+                don't have these fields populated yet keep the same
+                compact layout. */}
+            {(contactName || (!completed && tentativeDelivery) || completed) && (
+              <div className="mt-3 space-y-1.5">
+                {contactName && (
+                  <div className="flex items-center gap-2 text-sm text-slate-700">
+                    <User className="w-4 h-4 text-[#1a1a4e]" />
+                    <span>Brought by: <span className="font-semibold text-slate-900">{contactName}</span></span>
+                  </div>
+                )}
+                {!completed && tentativeDelivery && (
+                  <div className="flex items-center gap-2 text-sm text-amber-700 font-semibold">
+                    <Truck className="w-4 h-4 text-amber-600" />
+                    <span>Expected Delivery: {formatLongDate(tentativeDelivery)}</span>
+                  </div>
+                )}
+                {completed && (
+                  <div className="flex items-center gap-2 text-sm text-emerald-700 font-semibold">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    <span>Delivered: {formatLongDate(deliveredDate)}</span>
+                  </div>
+                )}
               </div>
             )}
+
           </div>
+
+
 
           {/* Tabs */}
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-1 mb-4 grid grid-cols-3 gap-1">
@@ -692,8 +781,58 @@ const CustomerJobDetailsView: React.FC<Props> = ({ job, onBack }) => {
           )}
 
           {!loading && activeTab === 'items' && (
-            <ItemsTab items={itemsList} completed={completed} />
+            <div className="space-y-3">
+              {/* Soft yellow callout with the operator-entered notes.
+                  Only renders when notesText is a non-empty string
+                  (resolveJobNotes already trims whitespace). Sits above
+                  the items list so the customer sees any special
+                  instructions before the per-item details. */}
+              {hasNotes && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 shadow-sm">
+                  <div className="flex items-center gap-2 mb-2">
+                    <StickyNote className="w-4 h-4 text-amber-700" />
+                    <p className="text-[11px] font-bold uppercase tracking-wide text-amber-800">
+                      Notes
+                    </p>
+                  </div>
+                  <p className="text-sm text-amber-900 whitespace-pre-wrap leading-relaxed">
+                    {notesText}
+                  </p>
+                </div>
+              )}
+
+              {/* Two-row date strip: Tentative / Delivered. Both rows
+                  always render (with an em-dash placeholder when the
+                  underlying date isn't set yet) so the strip stays
+                  rectangular and easy to scan. Mauritius-timezone
+                  formatted via formatLongDate above. */}
+              <div className="rounded-xl border border-slate-200 bg-white shadow-sm divide-y divide-slate-100">
+                <div className="flex items-center justify-between px-4 py-2.5">
+                  <div className="flex items-center gap-2 text-xs text-slate-500 font-semibold uppercase tracking-wide">
+                    <Truck className="w-3.5 h-3.5 text-amber-600" />
+                    Tentative
+                  </div>
+                  <span className={`text-sm font-semibold ${tentativeDelivery ? 'text-slate-900' : 'text-slate-400'}`}>
+                    {tentativeDelivery ? formatLongDate(tentativeDelivery) : '—'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between px-4 py-2.5">
+                  <div className="flex items-center gap-2 text-xs text-slate-500 font-semibold uppercase tracking-wide">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    Delivered
+                  </div>
+                  <span className={`text-sm font-semibold ${(job as any).delivered_date || (job as any).delivered_at ? 'text-slate-900' : 'text-slate-400'}`}>
+                    {((job as any).delivered_date || (job as any).delivered_at)
+                      ? formatLongDate(deliveredDate)
+                      : '—'}
+                  </span>
+                </div>
+              </div>
+
+              <ItemsTab items={itemsList} completed={completed} />
+            </div>
           )}
+
 
           {!loading && activeTab === 'history' && (
             <HistoryTab
@@ -715,10 +854,13 @@ const CustomerJobDetailsView: React.FC<Props> = ({ job, onBack }) => {
 
 /* ---------- Sub-components ---------- */
 
-const StatusPill: React.FC<{ status?: string | null }> = ({ status }) => {
-  const stage = classifyStage(status);
+const StatusPill: React.FC<{ job: Job }> = ({ job }) => {
+  // Drive both the colour AND the text label from the EFFECTIVE stage,
+  // i.e. from items[].status — not from the loose job.status string.
+  // This keeps the details summary in lockstep with the JobCard list.
+  const stage = deriveEffectiveStage(job);
   const style = STAGE_STYLES[stage];
-  const label = formatStatus(status);
+  const label = formatStatus(job);
   return (
     <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1 rounded-full ${style.badgeBg} ${style.badgeText}`}>
       <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
@@ -726,6 +868,7 @@ const StatusPill: React.FC<{ status?: string | null }> = ({ status }) => {
     </span>
   );
 };
+
 
 const Stat: React.FC<{ icon: React.ReactNode; value: React.ReactNode; label: string }> = ({ icon, value, label }) => (
   <div className="flex flex-col items-center justify-center py-3 px-2">
@@ -999,8 +1142,9 @@ const NotesTab: React.FC<{
           <div key={q.id} className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
             <div className="flex items-center justify-between gap-2 mb-2">
               <span className={`inline-flex text-[11px] font-medium px-2 py-0.5 rounded capitalize ${tone}`}>
-                {q.result || 'pending'}
+                {q.result || 'waiting'}
               </span>
+
               <span className="text-[11px] text-slate-400">
                 {formatLongDate(q.inspected_at || q.created_at)}
               </span>

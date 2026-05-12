@@ -30,9 +30,14 @@
     <meta property="og:description" content="" />
     <meta name="twitter:card" content="" />
 
-    <!-- Favicon -->
-    <link rel="icon" type="image/svg+xml" href="/placeholder.svg" />
-    <link rel="apple-touch-icon" href="/placeholder.svg" />
+    <!-- Favicon (build-id query string injected by Vite plugin) -->
+    <link rel="icon" type="image/png" href="/app-icon.png?v=__BUILD_ID__" />
+    <link rel="apple-touch-icon" href="/app-icon.png?v=__BUILD_ID__" />
+
+    <!-- PWA Manifest (cache-busted so Android refetches it on each deploy) -->
+    <link rel="manifest" href="/manifest.json?v=__BUILD_ID__" />
+
+
 
     <!-- PWA / Mobile -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -44,5 +49,47 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+
+    <!-- Service Worker registration for offline support / PWA caching.
+         New SW versions activate automatically: the SW calls
+         `self.skipWaiting()` on install and `clients.claim()` on activate,
+         so as soon as a new build is detected the page reloads once via
+         the `controllerchange` listener below. No user-facing "Reload"
+         prompt is shown — users may experience a single mid-session
+         reload, but will never get stuck on a stale build. -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker
+            .register('/sw.js', { scope: '/' })
+            .then(function (registration) {
+              // Poll for updates whenever the tab is foregrounded — catches
+              // long-lived tabs that never get a full page reload.
+              registration.update().catch(function () {});
+              document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'visible') {
+                  registration.update().catch(function () {});
+                }
+              });
+            })
+            .catch(function (err) {
+              console.warn('[sw] registration failed:', err);
+            });
+
+          // Reload exactly once when a new SW takes control, so users get
+          // fresh assets. Because the SW now calls skipWaiting() on install
+          // and clients.claim() on activate, this fires automatically as
+          // soon as a new deploy is detected — no user action required.
+          var refreshing = false;
+          navigator.serviceWorker.addEventListener('controllerchange', function () {
+            if (refreshing) return;
+            refreshing = true;
+            window.location.reload();
+          });
+        });
+      }
+    </script>
+
   </body>
 </html>
+
