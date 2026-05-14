@@ -1,0 +1,61 @@
+name: CI
+
+# Run on every push to main and on every pull request targeting main.
+# This catches missing-dependency issues (like `vite: command not found`)
+# before they ever reach Vercel / production.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch/PR when a new commit is pushed,
+# so we don't waste CI minutes on stale builds.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Install & Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Match a modern LTS that Vercel also supports.
+          node-version: '20'
+          # Cache npm's global cache keyed on package-lock.json for faster installs.
+          cache: 'npm'
+
+      # `npm ci` is the strict, reproducible install used by CI/CD systems
+      # (including Vercel). It requires package-lock.json to be in sync with
+      # package.json and will fail loudly if a dependency is missing — which
+      # is exactly the failure mode we want to catch here.
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # Run the exact same build command Vercel runs. If `vite` (or any other
+      # build-time tool) is misplaced in devDependencies vs dependencies, or
+      # if an import path is broken, this step will fail the PR before merge.
+      - name: Build production bundle
+        run: npm run build
+        env:
+          # Vite/CRA-style builds sometimes need NODE_ENV explicitly.
+          NODE_ENV: production
+
+      # Optional: upload the built artifact so reviewers can download and
+      # inspect what would have been deployed. Kept small (7 days).
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist
+          retention-days: 7
+          if-no-files-found: ignore
